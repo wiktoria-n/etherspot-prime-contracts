@@ -17,21 +17,29 @@ import "./Whitelist.sol";
  * - the paymaster signs to agree to PAY for GAS.
  * - the wallet signs to prove identity and account ownership.
  */
-contract EtherspotPaymaster is BasePaymaster, Whitelist, ReentrancyGuard {
+contract EtherspotPaymaster is BasePaymaster, ReentrancyGuard {
     using ECDSA for bytes32;
     using UserOperationLib for UserOperation;
 
     uint256 private constant VALID_TIMESTAMP_OFFSET = 20;
     uint256 private constant SIGNATURE_OFFSET = 84;
+    uint256 private constant SPONSOR_ADDRESS_OFFSET = SIGNATURE_OFFSET + 20;
     // calculated cost of the postOp
     uint256 private constant COST_OF_POST = 40000;
 
     mapping(address => uint256) private sponsorFunds;
 
+    address private verifyingSigner = address(0);
+
     event SponsorSuccessful(address paymaster, address sender);
     event SponsorUnsuccessful(address paymaster, address sender);
 
-    constructor(IEntryPoint _entryPoint) BasePaymaster(_entryPoint) {}
+    constructor(IEntryPoint _entryPoint) BasePaymaster(_entryPoint) {
+    }
+
+    function changeVerifyingSigner(address _verifier) external onlyOwner {
+        verifyingSigner = _verifier;
+    }
 
     function depositFunds() external payable nonReentrant {
         entryPoint.depositTo{value: msg.value}(address(this));
@@ -67,11 +75,13 @@ contract EtherspotPaymaster is BasePaymaster, Whitelist, ReentrancyGuard {
     }
 
     function _pack(
-        UserOperation calldata userOp
+        UserOperation calldata userOp,
+        address sponsorAddress
     ) internal pure returns (bytes32) {
         return
             keccak256(
                 abi.encode(
+                    sponsorAddress,
                     userOp.getSender(),
                     userOp.nonce,
                     keccak256(userOp.initCode),
@@ -95,14 +105,15 @@ contract EtherspotPaymaster is BasePaymaster, Whitelist, ReentrancyGuard {
     function getHash(
         UserOperation calldata userOp,
         uint48 validUntil,
-        uint48 validAfter
+        uint48 validAfter,
+        address sponsorAddress
     ) public view returns (bytes32) {
         //can't use userOp.hash(), since it contains also the paymasterAndData itself.
 
         return
             keccak256(
                 abi.encode(
-                    _pack(userOp),
+                    _pack(userOp, sponsorAddress),
                     block.chainid,
                     address(this),
                     validUntil,
@@ -128,26 +139,28 @@ contract EtherspotPaymaster is BasePaymaster, Whitelist, ReentrancyGuard {
         (
             uint48 validUntil,
             uint48 validAfter,
-            bytes calldata signature
-        ) = parsePaymasterAndData(userOp.paymasterAndData);
+            bytes calldata signature,
+            address sponsorAddress
+        ) = parsePaymasterAndData(userOp.paymasterAndData);        
+        require(
+            sponsorAddress != address(0) && sponsorAddress == verifyingSigner,
+            "EtherspotPaymaster:: invalid sponsorAddress"
+        );
+
         // ECDSA library supports both 64 and 65-byte long signatures.
         // we only "require" it here so that the revert reason on invalid signature will be of "EtherspotPaymaster", and not "ECDSA"
+
         require(
             signature.length == 64 || signature.length == 65,
             "EtherspotPaymaster:: invalid signature length in paymasterAndData"
         );
         bytes32 hash = ECDSA.toEthSignedMessageHash(
-            getHash(userOp, validUntil, validAfter)
+            getHash(userOp, validUntil, validAfter, sponsorAddress)
         );
         address sig = userOp.getSender();
 
         // check for valid paymaster
         address sponsorSig = ECDSA.recover(hash, signature);
-
-        // don't revert on signature failure: return SIG_VALIDATION_FAILED
-        if (!_check(sponsorSig, sig)) {
-            return ("", _packValidationData(true, validUntil, validAfter));
-        }
 
         // check sponsor has enough funds deposited to pay for gas
         require(
@@ -173,13 +186,14 @@ contract EtherspotPaymaster is BasePaymaster, Whitelist, ReentrancyGuard {
     )
         public
         pure
-        returns (uint48 validUntil, uint48 validAfter, bytes calldata signature)
+        returns (uint48 validUntil, uint48 validAfter, bytes calldata signature, address sponsorAddress)
     {
         (validUntil, validAfter) = abi.decode(
             paymasterAndData[VALID_TIMESTAMP_OFFSET:SIGNATURE_OFFSET],
             (uint48, uint48)
         );
-        signature = paymasterAndData[SIGNATURE_OFFSET:];
+        sponsorAddress = abi.decode(paymasterAndData[SIGNATURE_OFFSET:SPONSOR_ADDRESS_OFFSET], (address));
+        signature = paymasterAndData[SPONSOR_ADDRESS_OFFSET:];
     }
 
     function _postOp(
